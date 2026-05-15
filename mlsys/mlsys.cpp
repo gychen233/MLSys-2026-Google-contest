@@ -1,0 +1,1386 @@
+#pragma GCC optimize("Ofast")
+#include <iostream>
+#include <vector>
+#include <deque>
+#include <queue>
+#include <set>
+#include <string>
+#include <random>
+#include <chrono>
+#include <fstream>
+
+#include "json.hpp"
+using json = nlohmann::json;
+
+#define INF_LATENCY 1000000000000000ll
+#define init(a); memset(a, 0, sizeof(a));
+
+std::mt19937 rnd(std::chrono::steady_clock::now().time_since_epoch().count());
+#define ran(l, r) std::uniform_int_distribution<int>(l, r)(rnd)
+#define ran_real(l, r) std::uniform_real_distribution<double>(l, r)(rnd)
+
+std::string INPUT_PATH;
+std::string OUTPUT_PATH;
+
+int div_ceil(int n, int m) {
+    return (n + m - 1) / m;
+}
+
+int log2(int n) {
+    int ret = 0;
+    while (n > 1) {
+        n >>= 1;
+        ret++;
+    }
+    return ret;
+}
+
+struct Tensor {
+    int height;
+    int width;
+    int input;
+    std::vector<int> outputs;
+    bool is_input;
+    Tensor() : height(0), width(0), input(0), is_input(0) {}
+    Tensor(int height, int width) {
+        this->height = height;
+        this->width = width;
+    }
+    Tensor(int height, int width, int input) {
+        this->height = height;
+        this->width = width;
+        this->input = input;
+        this->is_input = 0;
+    }
+};
+
+struct Node {
+    double cost;
+    bool is_matmul;
+    std::vector<int> inputs;
+    std::vector<int> outputs;
+};
+
+void print(const std::vector<std::vector<int> >& subgraphs,
+    const std::vector<std::vector<int> >& granularities,
+    const std::vector<std::vector<int> >& tensors_to_retain,
+    const std::vector<std::vector<int> >& traversal_orders) {
+    for (int i = 0; i < subgraphs.size(); i++) {
+        for (int j = 0; j < subgraphs[i].size(); j++) {
+            printf("%d ", subgraphs[i][j]);
+        }
+        printf("\n");
+    }
+    for (int i = 0; i < granularities.size(); i++) {
+        for (int j = 0; j < granularities[i].size(); j++) {
+            printf("%d ", granularities[i][j]);
+        }
+        printf("\n");
+    }
+    for (int i = 0; i < tensors_to_retain.size(); i++) {
+        for (int j = 0; j < tensors_to_retain[i].size(); j++) {
+            printf("%d ", tensors_to_retain[i][j]);
+        }
+        printf("\n");
+    }
+    for (int i = 0; i < traversal_orders.size(); i++) {
+        for (int j = 0; j < traversal_orders[i].size(); j++) {
+            printf("%d ", traversal_orders[i][j]);
+        }
+        printf("\n");
+    }
+}
+
+class ScheduleEvaluator {
+private:
+    int n, m;
+    std::vector<Tensor> tensors;
+    std::vector<Node> nodes;
+    long long fast_memory_capacity;
+    double slow_memory_bandwidth;
+    std::vector<int> native_granularity;
+    std::vector<std::vector<int> > d_in, d_out;
+    std::vector<int> total_d_in, total_d_out;
+    std::vector<int> topo_seq;
+    int n_layers;
+    std::vector<bool> is_cut;
+    std::vector<std::vector<int> > subgraphs;
+    std::vector<std::vector<int> > granularities;
+    std::vector<std::vector<int> > tensors_to_retain;
+    std::vector<std::vector<int> > traversal_orders;
+    std::vector<bool> traversal_orders_type;
+    std::vector<bool> retain;
+    std::vector<double> latencies;
+    std::map<std::vector<bool>, double> memo;
+
+    std::vector<std::vector<int> > h;
+    std::vector<std::vector<int> > w;
+    std::vector<std::vector<bool> > is_h;
+
+    double best_latency;
+    std::vector<bool> best_cut;
+
+public:
+    ScheduleEvaluator() : n(0), m(0), fast_memory_capacity(0), slow_memory_bandwidth(0.) {}
+
+    ScheduleEvaluator(
+        const std::vector<int>& widths,
+        const std::vector<int>& heights,
+        const std::vector<std::vector<int> >& inputs,
+        const std::vector<std::vector<int> >& outputs,
+        const std::vector<double>& base_costs,
+        const std::vector<std::string>& op_types,
+        const long long fast_memory_capacity,
+        const double slow_memory_bandwidth,
+        const std::vector<int>& native_granularity
+    ) {
+        this->fast_memory_capacity = fast_memory_capacity;
+        this->slow_memory_bandwidth = slow_memory_bandwidth;
+        this->native_granularity = native_granularity;
+        this->native_granularity.push_back(native_granularity[0]);
+
+        this->n = heights.size();
+        assert(this->n == widths.size());
+        for (int i = 0; i < this->n; i++) {
+            Tensor t;
+            t.width = widths[i];
+            t.height = heights[i];
+            t.is_input = 1;
+            this->tensors.push_back(t);
+
+            h.push_back({ 0, 0 });
+            w.push_back({ 0, 0 });
+            is_h.push_back({ false, false });
+        }
+
+        this->m = inputs.size();
+        // assert(this->m == outputs.size());
+        // assert(this->m == base_costs.size());
+        // assert(this->m == op_types.size());
+        total_d_in.assign(n, 0);
+        total_d_out.assign(n, 0);
+        for (int i = 0; i < m; i++) {
+            Node nd;
+            nd.inputs = inputs[i];
+            nd.outputs = outputs[i];
+            nd.cost = base_costs[i];
+            if (op_types[i] == "MatMul") nd.is_matmul = 1;
+            else nd.is_matmul = 0;
+            nodes.push_back(nd);
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                tensors[nd.inputs[j]].outputs.push_back(i);
+                total_d_out[nd.inputs[j]]++;
+            }
+            for (int j = 0; j < nd.outputs.size(); j++) {
+                tensors[nd.outputs[j]].input = i;
+                tensors[nd.outputs[j]].is_input = 0;
+                total_d_in[nd.outputs[j]]++;
+            }
+        }
+
+        std::vector<int> d(m, 0);
+        for (int i = 0; i < n; i++) {
+            const Tensor& t = tensors[i];
+            if (!t.is_input) {
+                for (int j = 0; j < t.outputs.size(); j++) {
+                    d[t.outputs[j]]++;
+                }
+            }
+        }
+        std::queue<int> q;
+        for (int i = 0; i < m; i++) {
+            if (d[i] == 0) {
+                q.push(i);
+            }
+        }
+        while (q.size()) {
+            int x = q.front();
+            q.pop();
+            topo_seq.push_back(x);
+            const Node& nd = nodes[x];
+            for (int i = 0; i < nd.outputs.size(); i++) {
+                const Tensor& t = tensors[nd.outputs[i]];
+                for (int j = 0; j < t.outputs.size(); j++) {
+                    d[t.outputs[j]]--;
+                    if (d[t.outputs[j]] == 0) {
+                        q.push(t.outputs[j]);
+                    }
+                }
+            }
+        }
+
+        best_latency = INF_LATENCY;
+    }
+
+    void vector_resize() {
+        latencies.resize(n_layers);
+        retain.resize(n_layers);
+        tensors_to_retain.resize(n_layers);
+        granularities.resize(n_layers);
+        traversal_orders.resize(n_layers);
+        traversal_orders_type.resize(n_layers);
+    }
+
+    void get_necessity() {
+        n_layers = subgraphs.size();
+        d_in.resize(n_layers);
+        d_out.resize(n_layers);
+        for (int i = 0; i < subgraphs.size(); i++) {
+            d_in[i].assign(n, 0);
+            d_out[i].assign(n, 0);
+            for (int j = 0; j < subgraphs[i].size(); j++) {
+                const Node& nd = nodes[subgraphs[i][j]];
+                for (int k = 0; k < nd.outputs.size(); k++) {
+                    d_in[i][nd.outputs[0]]++;
+                }
+                for (int k = 0; k < nd.inputs.size(); k++) {
+                    d_out[i][nd.inputs[k]]++;
+                }
+            }
+        }
+        vector_resize();
+    }
+
+    int fd_fa(int x, std::vector<int>& fa) {
+        if (x != fa[x]) {
+            fa[x] = fd_fa(fa[x], fa);
+        }
+        return fa[x];
+    }
+
+    bool get_subgraphs() {
+        std::vector<int> fa;
+        for (int i = 0; i < m; i++) {
+            fa.push_back(i);
+        }
+        for (int i = 0; i < n; i++) {
+            const Tensor& t = tensors[i];
+            if (t.is_input) {
+                continue;
+            }
+            if (!is_cut[i]) {
+                int x = fd_fa(t.input, fa);
+                for (int j = 0; j < t.outputs.size(); j++) {
+                    fa[fd_fa(t.outputs[j], fa)] = x;
+                }
+            }
+        }
+        std::vector<int> d(m, 0);
+        std::vector<std::vector<int> > out;
+        out.resize(m);
+        for (int i = 0; i < n; i++) {
+            const Tensor& t = tensors[i];
+            if (t.is_input) {
+                continue;
+            }
+            if (is_cut[i]) {
+                int x = fd_fa(t.input, fa);
+                for (int j = 0; j < t.outputs.size(); j++) {
+                    int y = fd_fa(t.outputs[j], fa);
+                    if (x != y) {
+                        out[x].push_back(y);
+                        d[y]++;
+                    }
+                }
+            }
+        }
+        std::vector<int> order;
+        std::deque<int> dq;
+        for (int i = 0; i < m; i++) {
+            if (fa[i] == i) {
+                if (d[i] == 0) {
+                    dq.push_front(i);
+                }
+            }
+        }
+        while (dq.size()) {
+            int x = dq.front();
+            dq.pop_front();
+            order.push_back(x);
+            bool flag = 0;
+            for (int i = 0; i < out[x].size(); i++) {
+                d[out[x][i]]--;
+                if (d[out[x][i]] == 0) {
+                    if (!flag) {
+                        dq.push_front(out[x][i]);
+                        flag = 1;
+                    }
+                    else {
+                        dq.push_back(out[x][i]);
+                    }
+                }
+            }
+        }
+
+        std::vector<int> from_order;
+        from_order.resize(m);
+        for (int i = 0; i < order.size(); i++) {
+            from_order[order[i]] = i;
+        }
+        subgraphs.clear();
+        subgraphs.resize(order.size());
+        for (int j = 0; j < topo_seq.size(); j++) {
+            subgraphs[from_order[fa[topo_seq[j]]]].push_back(topo_seq[j]);
+        }
+
+        get_necessity();
+
+        for (int i = 0; i < subgraphs.size(); i++) {
+            // if (d_out[i][nodes[subgraphs[i].back()].outputs[0]] != 0) {
+            //     for (int j = 0; j < subgraphs[i].size(); j++) {
+            //         printf("%d ", subgraphs[i][j]);
+            //     }
+            //     printf("\n");
+            //     exit(0);
+            // }
+            for (int j = 0; j < subgraphs[i].size() - 1; j++) {
+                if (d_out[i][nodes[subgraphs[i][j]].outputs[0]] == 0) {
+                    // printf("Multiple outputs!\n");
+                    return 0;
+                }
+            }
+        }
+
+        // Check the legitimacy
+        std::vector<bool> used_op(m, false), is_computed(n, false);
+        for (int i = 0; i < subgraphs.size(); i++) {
+            for (int j = 0; j < subgraphs[i].size(); j++) {
+                used_op[subgraphs[i][j]] = true;
+            }
+        }
+        for (int i = 0; i < m; i++) {
+            if (!used_op[i]) {
+                // printf("!used_op[i]\n");
+                return 0; // assert
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            is_computed[i] = true;
+        }
+        for (int i = 0; i < m; i++) {
+            for (int j = 0; j < this->nodes[i].outputs.size(); j++) {
+                is_computed[nodes[i].outputs[j]] = false;
+            }
+        }
+
+        std::vector<bool> ephemeral_computed;
+        for (int i = 0; i < subgraphs.size(); i++) {
+            ephemeral_computed.assign(n, false);
+            for (int j = 0; j < subgraphs[i].size(); j++) {
+                const Node& nd = nodes[subgraphs[i][j]];
+                for (int k = 0; k < nd.inputs.size(); k++) {
+                    if (d_in[i][nd.inputs[k]] > 0) {
+                        if (!ephemeral_computed[nd.inputs[k]]) {
+                            // printf("!ephemeral_computed[nd.inputs[k]]\n");
+                            return 0; // assert
+                        }
+                    }
+                    else {
+                        if (!is_computed[nd.inputs[k]]) {
+                            // printf("!is_computed[nd.inputs[k]]\n");
+                            return 0; // assert
+                        }
+                    }
+                }
+                for (int k = 0; k < nd.outputs.size(); k++) {
+                    ephemeral_computed[nd.outputs[k]] = true;
+                }
+            }
+            for (int j = 0; j < subgraphs[i].size(); j++) {
+                const Node& nd = nodes[subgraphs[i][j]];
+                for (int k = 0; k < nd.outputs.size(); k++) {
+                    if (d_out[i][nodes[subgraphs[i][j]].outputs[k]] == 0) {
+                        is_computed[nodes[subgraphs[i][j]].outputs[k]] = true;
+                    }
+                }
+            }
+        }
+        return 1;
+    }
+
+    void upd_retain(int layer) {
+        tensors_to_retain[layer].clear();
+        if (retain[layer]) {
+            tensors_to_retain[layer].push_back(nodes[subgraphs[layer].back()].outputs[0]);
+        }
+    }
+
+    void upd_retains() {
+        tensors_to_retain.resize(n_layers);
+        for (int layer = 0; layer < n_layers; layer++) {
+            upd_retain(layer);
+        }
+    }
+
+    int get_point(int n, int m, int x, int y) {
+        return x * m + y;
+    }
+
+    void upd_traversal_orders_answer(int layer) {
+        traversal_orders[layer].clear();
+        int n_h = tensors[nodes[subgraphs[layer].back()].outputs[0]].height / granularities[layer][0];
+        int n_w = tensors[nodes[subgraphs[layer].back()].outputs[0]].width / granularities[layer][1];
+        if (traversal_orders_type[layer]) {
+            for (int i = 0; i < n_h / 2; i++) {
+                for (int j = 0; j < n_w; j++) {
+                    traversal_orders[layer].push_back(get_point(n_h, n_w, 2 * i, j));
+                }
+                for (int j = n_w - 1; j >= 0; j--) {
+                    traversal_orders[layer].push_back(get_point(n_h, n_w, 2 * i + 1, j));
+                }
+            }
+        }
+        else {
+            for (int j = 0; j < n_w / 2; j++) {
+                for (int i = 0; i < n_h; i++) {
+                    traversal_orders[layer].push_back(get_point(n_h, n_w, i, 2 * j));
+                }
+                for (int i = n_h - 1; i >= 0; i--) {
+                    traversal_orders[layer].push_back(get_point(n_h, n_w, i, 2 * j + 1));
+                }
+            }
+        }
+    }
+
+    void upd_traversal_orders_answers() {
+        for (int layer = 0; layer < n_layers; layer++) {
+            upd_traversal_orders_answer(layer);
+        }
+    }
+
+    double upd_traversal_order(int layer) {
+        int n_h = tensors[nodes[subgraphs[layer].back()].outputs[0]].height / granularities[layer][0];
+        int n_w = tensors[nodes[subgraphs[layer].back()].outputs[0]].width / granularities[layer][1];
+
+        if (n_h > 1 && n_w > 1) {
+            double h_latency, w_latency;
+
+            traversal_orders_type[layer] = false;
+            h_latency = get_latency(layer);
+
+            traversal_orders_type[layer] = true;
+            w_latency = get_latency(layer);
+
+            if (h_latency < w_latency) {
+                traversal_orders_type[layer] = false;
+            }
+            return std::min(h_latency, w_latency);
+        }
+        else {
+            if (n_h == 1) {
+                traversal_orders_type[layer] = true;
+            }
+            else {
+                traversal_orders_type[layer] = false;
+            }
+            return get_latency(layer);
+        }
+    }
+
+    bool comp(int h_new, int w_new, int h_old, int w_old, bool mode) {
+        if (!mode) {
+            if (h_new > h_old) {
+                return 1;
+            } else if (h_new == h_old && w_new > w_old) {
+                return 1;
+            } else {
+                return 0;
+            }
+        } else {
+            if (w_new > w_old) {
+                return 1;
+            } else if (w_new == w_old && h_new > h_old) {
+                return 1;
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    long long cal_memory(const std::vector<int>& granularity, int layer) {
+        // check the granularity
+        for (int i = 0; i < subgraphs[layer].size(); i++) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                int id = nd.inputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+            }
+            for (int j = 0; j < nd.outputs.size(); j++) {
+                int id = nd.outputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+            }
+        }
+        if (granularity[0] > native_granularity[0] || granularity[1] > native_granularity[1]) {
+            return INF_LATENCY;
+        }
+        for (int i = subgraphs[layer].size() - 1; i >= 0; i--) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            if (i == subgraphs[layer].size() - 1) {
+                if (nd.is_matmul) {
+                    h[nd.inputs[0]][0] = h[nd.inputs[0]][1] = granularity[0];
+                    w[nd.inputs[0]][0] = w[nd.inputs[0]][1] = tensors[nd.inputs[0]].width;
+                    h[nd.inputs[1]][0] = h[nd.inputs[1]][1] = tensors[nd.inputs[0]].width;
+                    w[nd.inputs[1]][0] = w[nd.inputs[1]][1] = granularity[1];
+                }
+                else {
+                    for (int j = 0; j < nd.inputs.size(); j++) {
+                        h[nd.inputs[j]][0] = h[nd.inputs[j]][1] = granularity[0];
+                        w[nd.inputs[j]][0] = w[nd.inputs[j]][1] = granularity[1];
+                    }
+                }
+            }
+            else {
+                if (nd.is_matmul) {
+                    for (int j = 0; j <= 1; j++) {
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][0], w[nd.inputs[0]][0], 0)) {
+                            h[nd.inputs[0]][0] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][0] = tensors[nd.inputs[0]].width;
+                        }
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][1], w[nd.inputs[0]][1], 1)) {
+                            h[nd.inputs[0]][1] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][1] = tensors[nd.inputs[0]].width;
+                        }
+
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][0], w[nd.inputs[1]][0], 0)) {
+                            h[nd.inputs[1]][0] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][0] = w[nd.outputs[0]][j];
+                        }
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][1], w[nd.inputs[1]][1], 1)) {
+                            h[nd.inputs[1]][1] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][1] = w[nd.outputs[0]][j];
+                        }
+                    }
+                }
+                else {
+                    if (h[nd.outputs[0]][0] > granularity[0] || w[nd.outputs[0]][0] > granularity[1]) {
+                        return INF_LATENCY;
+                    }
+                    if (h[nd.outputs[0]][1] > granularity[0] || w[nd.outputs[0]][1] > granularity[1]) {
+                        return INF_LATENCY;
+                    }
+                    for (int j = 0; j <= 1; j++) {
+                        for (int k = 0; k < nd.inputs.size(); k++) {
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][0], w[nd.inputs[k]][0], 0)) {
+                                h[nd.inputs[k]][0] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][0] = w[nd.outputs[0]][j];
+                            }
+
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][1], w[nd.inputs[k]][1], 1)) {
+                                h[nd.inputs[k]][1] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][1] = w[nd.outputs[0]][j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < subgraphs[layer].size(); i++) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                int id = nd.inputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+            }
+            for (int j = 0; j < nd.outputs.size(); j++) {
+                int id = nd.outputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+            }
+        }
+        for (int i = subgraphs[layer].size() - 1; i >= 0; i--) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            if (i == subgraphs[layer].size() - 1) {
+                if (nd.is_matmul) {
+                    h[nd.inputs[0]][0] = h[nd.inputs[0]][1] = granularity[0];
+                    w[nd.inputs[0]][0] = w[nd.inputs[0]][1] = granularity[2];
+                    h[nd.inputs[1]][0] = h[nd.inputs[1]][1] = granularity[2];
+                    w[nd.inputs[1]][0] = w[nd.inputs[1]][1] = granularity[1];
+                }
+                else {
+                    for (int j = 0; j < nd.inputs.size(); j++) {
+                        h[nd.inputs[j]][0] = h[nd.inputs[j]][1] = granularity[0];
+                        w[nd.inputs[j]][0] = w[nd.inputs[j]][1] = granularity[1];
+                    }
+                }
+            }
+            else {
+                if (nd.is_matmul) {
+                    for (int j = 0; j <= 1; j++) {
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][0], w[nd.inputs[0]][0], 0)) {
+                            h[nd.inputs[0]][0] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][0] = tensors[nd.inputs[0]].width;
+                        }
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][1], w[nd.inputs[0]][1], 1)) {
+                            h[nd.inputs[0]][1] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][1] = tensors[nd.inputs[0]].width;
+                        }
+
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][0], w[nd.inputs[1]][0], 0)) {
+                            h[nd.inputs[1]][0] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][0] = w[nd.outputs[0]][j];
+                        }
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][1], w[nd.inputs[1]][1], 1)) {
+                            h[nd.inputs[1]][1] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][1] = w[nd.outputs[0]][j];
+                        }
+                    }
+                }
+                else {
+                    for (int j = 0; j <= 1; j++) {
+                        for (int k = 0; k < nd.inputs.size(); k++) {
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][0], w[nd.inputs[k]][0], 0)) {
+                                h[nd.inputs[k]][0] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][0] = w[nd.outputs[0]][j];
+                            }
+
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][1], w[nd.inputs[k]][1], 1)) {
+                                h[nd.inputs[k]][1] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][1] = w[nd.outputs[0]][j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        int retained_input = n;
+        long long retain_memory = 0;
+        if (layer > 0) {
+            for (int i = 0; i < tensors_to_retain[layer - 1].size(); i++) {
+                retained_input = tensors_to_retain[layer - 1][i];
+                retain_memory += tensors[tensors_to_retain[layer - 1][i]].height * tensors[tensors_to_retain[layer - 1][i]].width;
+            }
+        }
+        for (int i = 0; i < tensors_to_retain[layer].size(); i++) {
+            retain_memory += tensors[tensors_to_retain[layer][i]].height * tensors[tensors_to_retain[layer][i]].width;
+        }
+
+        long long global_memory = 0;
+        for (int i = 0; i < subgraphs[layer].size(); i++) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                int id = nd.inputs[j];
+                if (d_in[layer][id] == 0 && id != retained_input) {
+                    // if (id == 0 && subgraphs[layer][0] == 10 && subgraphs[layer].size() == 2) {
+                    //     printf("%d %d %d\n", granularity[0], granularity[1], granularity[2]);
+                    //     printf("%d %d %d %d\n", h[id][0], w[id][0], h[id][1], w[id][1]);
+                    // }
+                    if (h[id][0] > h[id][1] && w[id][0] < w[id][1]) {
+                        global_memory += h[id][0] * w[id][0] + h[id][1] * w[id][1];
+                    }
+                    else {
+                        global_memory += std::max(h[id][0], h[id][1]) * std::max(w[id][0], w[id][1]);
+                    }
+                    h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+                }
+            }
+        }
+
+        long long output_memory = 0;
+        if (!retain[layer]) {
+            output_memory += granularity[0] * granularity[1];
+        }
+        return retain_memory + output_memory + global_memory;
+    }
+
+    void upd_granularity(int layer) {
+        std::vector<int> granularity, best_granularity;
+        bool best_traversal_orders_type;
+        double latency, best_latency = INF_LATENCY;
+
+        const Node& nd = nodes[subgraphs[layer].back()];
+        int H_lim_r = native_granularity[0];
+        int W_lim_r = native_granularity[1];
+        int H_lim_l = std::max(native_granularity[0] >> 4, 1);
+        int W_lim_l = std::max(native_granularity[1] >> 4, 1);
+
+        int K_lim = 1;
+        if (nd.is_matmul) {
+            K_lim = native_granularity[2];
+        }
+
+        std::vector<std::vector<int> > pos_k;
+        pos_k.resize(log2(H_lim_r / H_lim_l) + 1);
+        for (int i = 0; i < pos_k.size(); i++) {
+            pos_k[i].assign(log2(W_lim_r / W_lim_l) + 1, 0);
+        }
+        for (int H = H_lim_l, h = 0; H <= H_lim_r; H <<= 1, h++) {
+            for (int W = W_lim_l, w = 0; W <= W_lim_r; W <<= 1, w++) {
+                int k_lim = K_lim;
+                if (h > 0) {
+                    k_lim = std::min(k_lim, pos_k[h - 1][w]);
+                }
+                if (w > 0) {
+                    k_lim = std::min(k_lim, pos_k[h][w - 1]);
+                }
+                for (int K = k_lim; K >= 1; K >>= 1) {
+                    granularity = { H, W, K };
+                    if (cal_memory(granularity, layer) <= fast_memory_capacity) {
+                        granularities[layer] = granularity;
+                        latency = upd_traversal_order(layer);
+                        if (latency < best_latency) {
+                            best_latency = latency;
+                            best_granularity = granularity;
+                            best_traversal_orders_type = traversal_orders_type[layer];
+                        }
+                        pos_k[h][w] = K;
+                        break;
+                    }
+                }
+            }
+        }
+        latencies[layer] = best_latency;
+        granularities[layer] = best_granularity;
+        traversal_orders_type[layer] = best_traversal_orders_type;
+    }
+
+    bool upd_granularities() {
+        granularities.resize(n_layers);
+        for (int layer = 0; layer < n_layers; layer++) {
+            upd_granularity(layer);
+        }
+        return 1;
+    }
+
+    double compute_latency(const Node& nd, int H, int W, int K) {
+        if (nd.is_matmul) {
+            return (double)nd.cost * std::max(H / native_granularity[0], 1)
+                * std::max(W / native_granularity[1], 1)
+                * ((double)K / tensors[nd.inputs[0]].width); // native_granularity[2]
+        }
+        else {
+            return (double)nd.cost * std::max(H / native_granularity[0], 1)
+                * std::max(W / native_granularity[1], 1);
+        }
+    }
+
+    double get_latency(int layer) {
+        const long long n_h = tensors[nodes[subgraphs[layer].back()].outputs[0]].height / granularities[layer][0];
+        const long long n_w = tensors[nodes[subgraphs[layer].back()].outputs[0]].width / granularities[layer][1];
+        const long long n_k = nodes[subgraphs[layer].back()].is_matmul ? tensors[nodes[subgraphs[layer].back()].inputs[0]].width / granularities[layer][2] : 1;
+
+        double latency = 0.;
+        double cal_latency = 0.;
+        for (int i = 0; i < subgraphs[layer].size(); i++) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                int id = nd.inputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+                is_h[id][0] = is_h[id][1] = false;
+            }
+            for (int j = 0; j < nd.outputs.size(); j++) {
+                int id = nd.outputs[j];
+                h[id][0] = h[id][1] = w[id][0] = w[id][1] = 0;
+                is_h[id][0] = is_h[id][1] = false;
+            }
+        }
+        for (int i = subgraphs[layer].size() - 1; i >= 0; i--) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            int K = 1;
+            if (nd.is_matmul) {
+                K = (i == subgraphs[layer].size() - 1) ? granularities[layer][2] : tensors[nd.inputs[0]].width;
+            }
+            if (i == subgraphs[layer].size() - 1) {
+                if (nd.is_matmul) {
+                    h[nd.inputs[0]][0] = h[nd.inputs[0]][1] = granularities[layer][0];
+                    w[nd.inputs[0]][0] = w[nd.inputs[0]][1] = granularities[layer][2];
+                    is_h[nd.inputs[0]][0] = is_h[nd.inputs[0]][1] = true;
+                    h[nd.inputs[1]][0] = h[nd.inputs[1]][1] = granularities[layer][2];
+                    w[nd.inputs[1]][0] = w[nd.inputs[1]][1] = granularities[layer][1];
+                    is_h[nd.inputs[1]][0] = is_h[nd.inputs[1]][1] = false;
+
+                    cal_latency += compute_latency(nd, granularities[layer][0], granularities[layer][1], K);
+                }
+                else {
+                    for (int j = 0; j < nd.inputs.size(); j++) {
+                        h[nd.inputs[j]][0] = h[nd.inputs[j]][1] = granularities[layer][0];
+                        w[nd.inputs[j]][0] = w[nd.inputs[j]][1] = granularities[layer][1];
+                    }
+                    cal_latency += compute_latency(nd, granularities[layer][0], granularities[layer][1], K);
+                }
+            }
+            else {
+                if (h[nd.outputs[0]][0] > h[nd.outputs[0]][1] && w[nd.outputs[0]][0] < w[nd.outputs[0]][1]) {
+                    cal_latency += compute_latency(nd, h[nd.outputs[0]][0], w[nd.outputs[0]][0], K);
+                    cal_latency += compute_latency(nd, h[nd.outputs[0]][1], w[nd.outputs[0]][1], K);
+                }
+                else {
+                    cal_latency += compute_latency(nd, std::max(h[nd.outputs[0]][0], h[nd.outputs[0]][1]),
+                        std::max(w[nd.outputs[0]][0], w[nd.outputs[0]][1]), K);
+                }
+                if (nd.is_matmul) {
+                    for (int j = 0; j <= 1; j++) {
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][0], w[nd.inputs[0]][0], 0)) {
+                            h[nd.inputs[0]][0] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][0] = tensors[nd.inputs[0]].width;
+                            is_h[nd.inputs[0]][0] = is_h[nd.outputs[0]][j];
+                        }
+                        if (comp(h[nd.outputs[0]][j], tensors[nd.inputs[0]].width, h[nd.inputs[0]][1], w[nd.inputs[0]][1], 1)) {
+                            h[nd.inputs[0]][1] = h[nd.outputs[0]][j];
+                            w[nd.inputs[0]][1] = tensors[nd.inputs[0]].width;
+                            is_h[nd.inputs[0]][1] = is_h[nd.outputs[0]][j];
+                        }
+
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][0], w[nd.inputs[1]][0], 0)) {
+                            h[nd.inputs[1]][0] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][0] = w[nd.outputs[0]][j];
+                            is_h[nd.inputs[1]][0] = is_h[nd.outputs[0]][j];
+                        }
+                        if (comp(tensors[nd.inputs[1]].height, w[nd.outputs[0]][j], h[nd.inputs[1]][1], w[nd.inputs[1]][1], 1)) {
+                            h[nd.inputs[1]][1] = tensors[nd.inputs[1]].height;
+                            w[nd.inputs[1]][1] = w[nd.outputs[0]][j];
+                            is_h[nd.inputs[1]][1] = is_h[nd.outputs[0]][j];
+                        }
+                    }
+                }
+                else {
+                    for (int j = 0; j <= 1; j++) {
+                        for (int k = 0; k < nd.inputs.size(); k++) {
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][0], w[nd.inputs[k]][0], 0)) {
+                                h[nd.inputs[k]][0] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][0] = w[nd.outputs[0]][j];
+                                is_h[nd.inputs[k]][0] = is_h[nd.outputs[0]][j];
+                            }
+
+                            if (comp(h[nd.outputs[0]][j], w[nd.outputs[0]][j], h[nd.inputs[k]][1], w[nd.inputs[k]][1], 1)) {
+                                h[nd.inputs[k]][1] = h[nd.outputs[0]][j];
+                                w[nd.inputs[k]][1] = w[nd.outputs[0]][j];
+                                is_h[nd.inputs[k]][1] = is_h[nd.outputs[0]][j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        double global_memory = 0.;
+        double part_memory[2] = { 0., 0. };
+        double full_memory = 0.;
+        double part_k_memory[2] = { 0., 0. };
+        double k_memory = 0.;
+
+        int retained_input = n;
+        if (layer > 0 && retain[layer - 1]) {
+            retained_input = nodes[subgraphs[layer - 1].back()].outputs[0];
+        }
+
+        for (int i = 0; i < subgraphs[layer].size(); i++) {
+            const Node& nd = nodes[subgraphs[layer][i]];
+            for (int j = 0; j < nd.inputs.size(); j++) {
+                int id = nd.inputs[j];
+                if (d_in[layer][id] == 0 && id != retained_input) {
+                    if (h[id][0] > h[id][1] && w[id][0] < w[id][1]) {
+                        global_memory += h[id][0] * w[id][0] + h[id][1] * w[id][1];
+                    }
+                    else {
+                        global_memory += std::max(h[id][0], h[id][1]) * std::max(w[id][0], w[id][1]);
+                    }
+                    if ((h[id][0] == tensors[id].height && w[id][0] == tensors[id].width)
+                        || (h[id][1] == tensors[id].height && w[id][1] == tensors[id].width)) {
+                        full_memory += h[id][0] * w[id][0];
+                    }
+                    else {
+                        if (h[id][0] == h[id][1] && w[id][0] == w[id][1]) {
+                            part_memory[is_h[id][0]] += h[id][0] * w[id][0];
+                            if ((is_h[id][0] && w[id][0] == tensors[id].width) || (!is_h[id][0] && h[id][0] == tensors[id].height)) {
+                                part_k_memory[is_h[id][0]] += h[id][0] * w[id][0];
+                            }
+                            if (is_h[id][0] != is_h[id][1]) {
+                                part_memory[is_h[id][1]] += h[id][1] * w[id][1];
+                                if ((is_h[id][1] && w[id][1] == tensors[id].width) || (!is_h[id][1] && h[id][1] == tensors[id].height)) {
+                                    part_k_memory[is_h[id][1]] += h[id][1] * w[id][1];
+                                }
+                            }
+                            
+                            if (((is_h[id][0] && w[id][0] == tensors[id].width) || (!is_h[id][0] && h[id][0] == tensors[id].height)) ||
+                                ((is_h[id][1] && w[id][1] == tensors[id].width) || (!is_h[id][1] && h[id][1] == tensors[id].height))) {
+                                k_memory += h[id][0] * w[id][0];
+                            }
+                        }
+                        else {
+                            if (h[id][0] > h[id][1]) {
+                                part_memory[is_h[id][0]] += h[id][0] * w[id][0];
+                                if ((is_h[id][0] && w[id][0] == tensors[id].width) || (!is_h[id][0] && h[id][0] == tensors[id].height)) {
+                                    part_k_memory[is_h[id][0]] += h[id][0] * w[id][0];
+                                    k_memory += h[id][0] * w[id][0];
+                                }
+                            }
+                            if (w[id][0] < w[id][1]) {
+                                part_memory[is_h[id][1]] += h[id][1] * w[id][1];
+                                if ((is_h[id][1] && w[id][1] == tensors[id].width) || (!is_h[id][1] && h[id][1] == tensors[id].height)) {
+                                    part_k_memory[is_h[id][1]] += h[id][1] * w[id][1];
+                                    k_memory += h[id][1] * w[id][1];
+                                }
+                            }
+                        }
+                    }
+                    h[id][0] = w[id][0] = h[id][1] = w[id][1] = 0;
+                }
+            }
+        }
+
+        bool output_is_retained = retain[layer];
+        bool row_continuous = traversal_orders_type[layer];
+        int m = (n_h * n_w == 1) ? 1 : 3;
+        int m_k = (n_k == 1) ? 1 : 3;
+        for (int i = 0; i < m; i++) {
+            for (int k = 0; k < m_k; k++) {
+                double turn_memory = global_memory;
+                double link_h_memory = 0;
+                double link_w_memory = 0;
+                if (!(i == 0 && k == 0)) {
+                    turn_memory -= full_memory;
+                    if (nodes[subgraphs[layer].back()].is_matmul) {
+                        if (n_k > 1) {
+                            if (k == 0) {
+                                link_h_memory -= part_k_memory[0];
+                                link_w_memory -= part_k_memory[1];
+                            }
+                            else {
+                                turn_memory -= k_memory;
+                            }
+                        }
+                        else {
+                            link_h_memory -= part_memory[0];
+                            link_w_memory -= part_memory[1];
+                        }
+                    }
+                }
+                if (k == m_k - 1 && !output_is_retained) {
+                    turn_memory += granularities[layer][0] * granularities[layer][1];
+                }
+                if (i == m - 1 && k == m_k - 1) {
+                    int id = nodes[subgraphs[layer].back()].outputs[0];
+                    if (total_d_out[id] == 0) {
+                        if (output_is_retained) {
+                            turn_memory += tensors[id].height * tensors[id].width;
+                        }
+                    }
+                }
+                long long num;
+                if (k != 0 && k != m_k - 1) {
+                    num = n_k - 2;
+                }
+                else {
+                    num = 1;
+                }
+                long long h_num, w_num;
+                if (i == 0) {
+                    if (row_continuous) {
+                        h_num = 0;
+                        w_num = num;
+                    }
+                    else {
+                        h_num = num;
+                        w_num = 0;
+                    }
+                }
+                else if (i == m - 1) {
+                    if (row_continuous) {
+                        h_num = 0;
+                        w_num = num;
+                    }
+                    else {
+                        h_num = num;
+                        w_num = 0;
+                    }
+                }
+                else {
+                    if (row_continuous) {
+                        h_num = num * (n_h - 1);
+                        w_num = num * (n_h * (n_w - 1) - 1);
+                    }
+                    else {
+                        h_num = num * (n_w * (n_h - 1) - 1);
+                        w_num = num * (n_w - 1);
+                    }
+                }
+                latency += std::max((turn_memory + link_h_memory) / slow_memory_bandwidth, cal_latency) * h_num;
+                latency += std::max((turn_memory + link_w_memory) / slow_memory_bandwidth, cal_latency) * w_num;
+                // if (layer == 0 && granularities[layer][0] == 128 && granularities[layer][1] == 128 && granularities[layer][2] == 128) {
+                //     printf("%lf %lf %lf\n", turn_memory, linlatenciesk_h_memory, link_w_memory);
+                //     printf("%d %d\n", h_num, w_num);
+                //     printf("%lf\n", latency);
+                // }
+            }
+        }
+        return latency;
+    }
+
+    void upd_latencies() {
+        latencies.resize(n_layers);
+        for (int layer = 0; layer < n_layers; layer++) {
+            latencies[layer] = get_latency(layer);
+        }
+    }
+
+    double get_total_latency() {
+        double total_latency = 0.;
+        for (int layer = 0; layer < n_layers; layer++) {
+            total_latency += latencies[layer];
+        }
+        return total_latency;
+    }
+
+    std::tuple<double, std::vector<bool> > get_retain() {
+        std::vector<double> latency = { INF_LATENCY, INF_LATENCY };
+        std::vector<std::vector<int> > pre;
+        std::vector<double> temp_latency = { INF_LATENCY, INF_LATENCY };
+        std::vector<int> temp_pre = { 0, 0 };
+        for (int layer = 0; layer < n_layers; layer++) {
+            if (layer == 0) {
+                retain[layer] = 0;
+                upd_retain(layer);
+                upd_granularity(layer);
+                temp_latency[0] = latencies[layer];
+                temp_pre[0] = 0;
+
+                retain[layer] = 1;
+                upd_retain(layer);
+                upd_granularity(layer);
+                temp_latency[1] = latencies[layer];
+                temp_pre[1] = 0;
+            }
+            else {
+                if (latency[0] < INF_LATENCY / 2) {
+                    retain[layer - 1] = 0;
+                    upd_retain(layer - 1);
+
+                    retain[layer] = 0;
+                    upd_retain(layer);
+                    upd_granularity(layer);
+                    temp_latency[0] = latencies[layer] + latency[0];
+                    temp_pre[0] = 0;
+
+                    retain[layer] = 1;
+                    upd_retain(layer);
+                    upd_granularity(layer);
+                    temp_latency[1] = latencies[layer] + latency[0];
+                    temp_pre[1] = 0;
+                }
+                else {
+                    temp_latency[0] = INF_LATENCY;
+                    temp_pre[0] = 0;
+                    temp_latency[1] = INF_LATENCY;
+                    temp_pre[1] = 0;
+                }
+
+                if (latency[1] < INF_LATENCY / 2) {
+                    retain[layer - 1] = 1;
+                    upd_retain(layer - 1);
+
+                    retain[layer] = 0;
+                    upd_retain(layer);
+                    upd_granularity(layer);
+
+                    if (latencies[layer] + latency[1] < temp_latency[0]) {
+                        temp_latency[0] = latencies[layer] + latency[1];
+                        temp_pre[0] = 1;
+                    }
+
+                    retain[layer] = 1;
+                    upd_retain(layer);
+                    upd_granularity(layer);
+                    if (latencies[layer] + latency[1] < temp_latency[1]) {
+                        temp_latency[1] = latencies[layer] + latency[1];
+                        temp_pre[1] = 1;
+                    }
+                }
+            }
+            latency = temp_latency;
+            pre.push_back(temp_pre);
+        }
+        std::vector<bool> retain_strategy;
+        bool retain_now = false;
+        for (int layer = n_layers - 1; layer >= 0; layer--) {
+            retain_strategy.push_back(retain_now);
+            retain_now = pre[layer][retain_now];
+        }
+        std::reverse(retain_strategy.begin(), retain_strategy.end());
+        return { latency[0], retain_strategy };
+    }
+
+    void ini(std::vector<std::vector<int> >& subgraphs,
+        std::vector<std::vector<int> >& granularities,
+        std::vector<std::vector<int> >& tensors_to_retain,
+        std::vector<std::vector<int> >& traversal_orders) {
+        this->subgraphs = subgraphs;
+        get_necessity();
+        this->granularities = granularities;
+        this->tensors_to_retain = tensors_to_retain;
+        retain.resize(n_layers);
+        for (int layer = 0; layer < n_layers; layer++) {
+            if (tensors_to_retain[layer].empty()) {
+                retain[layer] = false;
+            }
+            else {
+                retain[layer] = true;
+            }
+        }
+        this->traversal_orders = traversal_orders;
+    }
+
+    std::tuple<std::vector<std::vector<int> >,
+        std::vector<std::vector<int> >,
+        std::vector<std::vector<int> >,
+        std::vector<std::vector<int> >,
+        std::vector<double> > final_solution(std::vector<bool>& best_cut) {
+        std::vector<bool> temp_cut = is_cut;
+        is_cut = best_cut;
+        get_subgraphs();
+
+        auto [best_latency, best_retain] = get_retain();
+        retain = best_retain;
+        upd_retains();
+        upd_granularities();
+        upd_traversal_orders_answers();
+        upd_latencies();
+
+        is_cut = temp_cut;
+        return { subgraphs, granularities, tensors_to_retain, traversal_orders, latencies };
+    }
+
+    void load_answer() {
+        auto [subgraphs, granularities, tensors_to_retain, traversal_orders, latencies] =
+            final_solution(best_cut);
+
+        nlohmann::ordered_json j_out;
+        j_out["subgraphs"] = subgraphs;
+        j_out["granularities"] = granularities;
+        j_out["tensors_to_retain"] = tensors_to_retain;
+        for (int i = 0; i < traversal_orders.size(); i++) {
+            j_out["traversal_orders"].push_back(
+                traversal_orders[i].empty() ? nlohmann::ordered_json(nullptr) : nlohmann::ordered_json(traversal_orders[i])
+            );
+        }
+        j_out["subgraph_latencies"] = latencies;
+        std::ofstream file_out(OUTPUT_PATH);
+        file_out << j_out.dump(4);
+        file_out.close();
+    }
+
+    void upd_answer(double current_latency, std::vector<bool> current_cut) {
+        // printf("%lf\n", current_latency);
+        if (current_latency < best_latency) {
+            best_latency = current_latency;
+            best_cut = current_cut;
+            load_answer();
+        }
+    }
+
+    void sa_solution() {
+        double best_latency, current_latency;
+        std::vector<bool> best_cut;
+        is_cut.assign(n, true);
+
+        get_subgraphs();
+
+        auto [new_latency, new_retain] = get_retain();
+        best_latency = current_latency = new_latency;
+        best_cut = is_cut;
+        // printf("%lf\n", current_latency);
+
+        double init_temp_0 = current_latency * 10;
+        double min_temp_0 = 0.01;
+        double cooling_rate_0 = 0.995;
+        int T = 0;
+
+        for (double temp_0 = init_temp_0; temp_0 >= min_temp_0;) {
+            int x = ran(0, n - 1);
+            is_cut[x] = !is_cut[x];
+
+            if (!get_subgraphs()) { is_cut[x] = !is_cut[x]; }
+            else {
+                temp_0 *= cooling_rate_0;
+                double new_latency;
+                if (memo.count(is_cut)) {
+                    new_latency = memo[is_cut];
+                }
+                else {
+                    auto [temp, new_retain] = get_retain();
+                    // variables declared with auto are automatically destroyed when they go out of scope.
+                    new_latency = temp;
+                    memo[is_cut] = new_latency;
+                }
+
+                if (current_latency > new_latency || ran_real(0, 1) < std::exp((current_latency - new_latency) / temp_0)) {
+                    if (best_latency > new_latency) {
+                        best_latency = new_latency;
+                        best_cut = is_cut;
+                    }
+                    current_latency = new_latency;
+                }
+                else {
+                    is_cut[x] = !is_cut[x];
+                }
+            }
+
+            T++;
+            if (T % 500 == 0) {
+                upd_answer(best_latency, best_cut);
+            }
+        }
+        upd_answer(best_latency, best_cut);
+        printf("%lf\n", best_latency);
+    }
+
+    std::vector<double> evaluate(std::vector<std::vector<int> >& subgraphs,
+        std::vector<std::vector<int> >& granularities,
+        std::vector<std::vector<int> >& tensors_to_retain,
+        std::vector<std::vector<int> >& traversal_orders) {
+        ini(subgraphs,
+            granularities,
+            tensors_to_retain,
+            traversal_orders);
+        upd_latencies();
+        return latencies;
+    }
+
+    bool check_OOM(std::vector<std::vector<int> >& subgraphs,
+        std::vector<std::vector<int> >& granularities,
+        std::vector<std::vector<int> >& tensors_to_retain,
+        std::vector<std::vector<int> >& traversal_orders) {
+        ini(subgraphs,
+            granularities,
+            tensors_to_retain,
+            traversal_orders);
+        for (int layer = 0; layer < n_layers; layer++) {
+            if (cal_memory(granularities[layer], layer) > fast_memory_capacity) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+};
+
+void solve(const std::string INPUT_PATH, const std::string OUTPUT_PATH) {
+    std::ifstream file_in(INPUT_PATH);
+    json j_in;
+    file_in >> j_in;
+
+    std::vector<int> widths = j_in["widths"];
+    std::vector<int> heights = j_in["heights"];
+    std::vector<std::vector<int> > inputs = j_in["inputs"];
+    std::vector<std::vector<int> > outputs = j_in["outputs"];
+    std::vector<double> base_costs = j_in["base_costs"];
+    std::vector<std::string> op_types = j_in["op_types"];
+    long long fast_memory_capacity = j_in["fast_memory_capacity"];
+    double slow_memory_bandwidth = j_in["slow_memory_bandwidth"];
+    std::vector<int> native_granularity = j_in["native_granularity"];
+
+    auto start = std::chrono::high_resolution_clock::now();
+    ScheduleEvaluator myEvaluater(
+        widths,
+        heights,
+        inputs,
+        outputs,
+        base_costs,
+        op_types,
+        fast_memory_capacity,
+        slow_memory_bandwidth,
+        native_granularity
+    );
+
+    for (int t = 0; t < 1; t++) {
+        myEvaluater.sa_solution();
+    }
+
+    // print(subgraphs, granularities, tensors_to_retain, traversal_orders);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    std::cout << "time:" << duration.count() << " ms" << std::endl;
+}
+
+void check_out(const std::string INPUT_PATH, const std::string OUTPUT_PATH, bool mode = 0) {
+    std::ifstream file_in(INPUT_PATH);
+    if (!file_in.is_open()) {
+        std::cerr << "Can't open input.json!" << std::endl;
+        return;
+    }
+    json j_in;
+    file_in >> j_in;
+
+    std::vector<int> widths = j_in["widths"];
+    std::vector<int> heights = j_in["heights"];
+    std::vector<std::vector<int> > inputs = j_in["inputs"];
+    std::vector<std::vector<int> > outputs = j_in["outputs"];
+    std::vector<double> base_costs = j_in["base_costs"];
+    std::vector<std::string> op_types = j_in["op_types"];
+    long long fast_memory_capacity = j_in["fast_memory_capacity"];
+    double slow_memory_bandwidth = j_in["slow_memory_bandwidth"];
+    std::vector<int> native_granularity = j_in["native_granularity"];
+
+    ScheduleEvaluator myEvaluater(
+        widths,
+        heights,
+        inputs,
+        outputs,
+        base_costs,
+        op_types,
+        fast_memory_capacity,
+        slow_memory_bandwidth,
+        native_granularity
+    );
+
+    std::ifstream file_out(OUTPUT_PATH);
+    if (!file_out.is_open()) {
+        std::cerr << "Can't open output.json!" << std::endl;
+        return;
+    }
+
+    json j_out;
+    file_out >> j_out;
+
+    std::vector<std::vector<int> > subgraphs = j_out["subgraphs"];
+    std::vector<std::vector<int> > granularities = j_out["granularities"];
+    std::vector<std::vector<int> > tensors_to_retain = j_out["tensors_to_retain"];
+    std::vector<std::vector<int> > traversal_orders;
+    for (auto& item : j_out["traversal_orders"]) {
+        if (item.is_null()) {
+            traversal_orders.push_back({});
+        }
+        else {
+            traversal_orders.push_back(item.get<std::vector<int> >());
+        }
+    }
+
+    if (!myEvaluater.check_OOM(subgraphs, granularities, tensors_to_retain, traversal_orders)) {
+        printf("OOM!\n");
+        return;
+    }
+
+    std::vector<double> latencies = myEvaluater.evaluate(subgraphs, granularities, tensors_to_retain, traversal_orders);
+
+    if (!mode) {
+        std::vector<double> subgraph_latencies = j_out["subgraph_latencies"];
+        for (int i = 0; i < latencies.size(); i++) {
+            if (subgraph_latencies[i] != latencies[i]) {
+                printf("Latency of subgraph %d is wrong!\n", i);
+            }
+        }
+        printf("Latencies is right!\n");
+    }
+    else {
+        for (int i = 0; i < latencies.size(); i++) {
+            printf("%lf\n", latencies[i]);
+        }
+        printf("%lf\n", myEvaluater.get_total_latency());
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // std::cout << "case: " << argv[1] << std::endl;
+
+    INPUT_PATH = argv[1];
+    OUTPUT_PATH = argv[2];
+
+    solve(argv[1], argv[2]);
+
+    // INPUT_PATH = "input.json";
+    // OUTPUT_PATH = "output.json";
+    // solve("input.json", "output.json");
+
+    // check_out("input.json", "output.json", 1);
+    return 0;
+}
